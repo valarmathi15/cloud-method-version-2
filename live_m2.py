@@ -104,11 +104,12 @@ SPAN_RULES = {                       # exit rule for the "Span" options (price =
 SPAN_TEXT = {'A': 'Span A', 'B': 'Span B', 'A&B': 'Span A & B', 'AorB': 'Span A or B'}
 
 
-def run_m2(df, profit_target_pct, max_lots, start_date=None, lot_qty=1.0, trace=None, span=None, candle='every', lot_amount=None):
+def run_m2(df, profit_target_pct, max_lots, start_date=None, lot_qty=1.0, trace=None, span=None, candle='every', lot_amount=None, skip=None):
     """Method 2 (Google-sheet logic).
     span   : None = exit on Profit target %;  'A' / 'B' / 'A&B' / 'AorB' = exit when Close falls below that span
              (whole position closed; span exits go flat, no repeat exits).
     lot_amount : None = every lot buys `lot_qty` units;  number = every lot invests this AMOUNT (units = amount / lot price).
+    skip   : list of (from, to) timestamps - bars inside are ignored (strategy was paused; no buy / exit then).
     candle : 'every' = buy 1 lot on every candle above the cloud;  'daily' = at most 1 lot per day;
              'weekly' = at most 1 lot per week (first candle of the period that closes above the cloud).
     Returns trades DataFrame; trace (list) gets one dict per bar."""
@@ -138,6 +139,8 @@ def run_m2(df, profit_target_pct, max_lots, start_date=None, lot_qty=1.0, trace=
         if pd.isna(row['CloudTop']) or pd.isna(row['CloudBottom']):
             continue
         price, date = row['Close'], row['Date']
+        if skip and any(a < date < b for a, b in skip):
+            continue
         above = bool(row['AboveCloud'])
         bought, prev_lots = False, 0
         if m2_first:
@@ -362,9 +365,9 @@ def prepare(raw, tf, close_t, now):
 
 
 # =============================================================== M2 live state
-def compute_m2(df, profit_pct, max_lots, start, qty=1.0, span=None, candle='every', amount=None):
+def compute_m2(df, profit_pct, max_lots, start, qty=1.0, span=None, candle='every', amount=None, skip=None):
     trace = []
-    trades = run_m2(df, profit_pct, max_lots, start_date=start, lot_qty=qty, trace=trace, span=span, candle=candle, lot_amount=amount)
+    trades = run_m2(df, profit_pct, max_lots, start_date=start, lot_qty=qty, trace=trace, span=span, candle=candle, lot_amount=amount, skip=skip)
     tr = pd.DataFrame(trace)
     if tr.empty:
         return tr, trades
@@ -494,9 +497,11 @@ def evaluate(s):
     """-> dict with tr (bar log), trades and the numbers shown in the summary."""
     h, m = [int(x) for x in s['close'].split(':')]
     raw, checked, data_err = get_candles(s)
-    df = prepare(raw, s['tf'], dt.time(h, m), now_ist())
+    now = pd.Timestamp(s['paused_at']) if s.get('paused_at') else now_ist()      # paused = frozen as of that moment
+    df = prepare(raw, s['tf'], dt.time(h, m), now)
+    skip = [(pd.Timestamp(a), pd.Timestamp(b)) for a, b in s.get('gaps', [])]
     tr, trades = compute_m2(df, s.get('profit') or 0.0, int(s['lots']), s['start'], s['qty'],
-                            span=s.get('span'), candle=s.get('candle', 'every'), amount=s.get('amount'))
+                            span=s.get('span'), candle=s.get('candle', 'every'), amount=s.get('amount'), skip=skip)
     out = {'s': s, 'tr': tr, 'trades': trades, 'status': 'Waiting for 1st candle', 'last': None,
            'checked': checked, 'data_err': data_err,
            'closed_n': 0, 'closed_pnl': 0.0, 'open_pnl': 0.0, 'invested': 0.0}
@@ -724,40 +729,6 @@ def page_builder():
                     st.warning(f'{len(skipped)} file(s) already existed and were kept as they are (their start time is unchanged).')
 
 
-def detail(ev):
-    s, tr, trades, last = ev['s'], ev['tr'], ev['trades'], ev['last']
-    st.markdown(f"#### {s['name']}")
-    st.caption(f"{s['exchange']}:{s['symbol']}  |  {s['tf']}  |  {s['lots']} lots  |  exit {exit_text(s)}  |  buy {candle_text(s).lower()}  |  {('amount/lot ' + format(s['amount'], ',.0f')) if s.get('amount') else ('qty/lot ' + format(s['qty'], 'g'))}"
-               f"  |  capital {money(s['capital'])}  |  started {s['start']}")
-    if last is None:
-        st.info('Waiting for the first closed candle after the start time (cloud needs 78+ bars of history).')
-        return
-    flat = ev['flat']
-    c = st.columns(3)
-    c[0].metric('Last closed bar', str(last['Date'])[:16])
-    c[1].metric('Close', f"{last['Close']:.2f}")
-    c[2].metric('Signal', last['Signal'])
-    c = st.columns(3)
-    c[0].metric('Position', ev['status'])
-    c[1].metric('Avg entry', '-' if flat else f"{last['AvgPrice']:.2f}",
-                None if flat or pd.isna(last['Unrealised %']) else f"{last['Unrealised %']:.2f}%")
-    c[2].metric('Cloud top / bottom', f"{last['CloudTop']:.2f} / {last['CloudBottom']:.2f}")
-    total = ev['closed_pnl'] + ev['open_pnl']
-    c = st.columns(3)
-    c[0].metric('Closed P&L', money(ev['closed_pnl']), f"{ev['closed_n']} trades", delta_color='off')
-    c[1].metric('Open P&L', money(ev['open_pnl']))
-    c[2].metric('Total P&L', money(total), f"{total / s['capital'] * 100:.2f}% of capital" if s['capital'] else None)
-    st.line_chart(tr.tail(150).set_index('Date')[['Close', 'CloudTop', 'CloudBottom']])
-    t1, t2 = st.tabs(['Bar log (latest first)', 'Trades'])
-    with t1:
-        st.dataframe(tr.sort_values('Date', ascending=False).head(100), width='stretch', hide_index=True)
-    with t2:
-        if trades.empty:
-            st.write('No trades yet.')
-        else:
-            st.dataframe(trades.sort_values('Exit Date', ascending=False), width='stretch', hide_index=True)
-
-
 def save_strategy(folder, fname, s):
     with open(os.path.join(user_dir(), safe(folder), fname), 'w', encoding='utf-8') as f:
         json.dump(s, f, indent=1)
@@ -771,6 +742,235 @@ def exit_strategy(folder, fname, ev):
                   'realized': (ev['closed_pnl'] + ev['open_pnl']) if ev else 0.0,
                   'at': now_ist().strftime('%Y-%m-%d %H:%M')}
     save_strategy(folder, fname, s)
+
+
+def log_event(s, text):
+    s.setdefault('events', []).append({'time': now_ist().strftime('%Y-%m-%d %H:%M:%S'), 'event': text})
+
+
+def strat_state(s):
+    return 'EXITED' if s.get('stopped') else ('PAUSED' if s.get('paused_at') else 'RUNNING')
+
+
+def pause_strategy(folder, fname):
+    s = load_strategy(folder, fname)
+    s['paused_at'] = now_ist().strftime('%Y-%m-%d %H:%M:%S')
+    log_event(s, 'Stopped (paused) - no buy / exit until Resume')
+    save_strategy(folder, fname, s)
+
+
+def resume_strategy(folder, fname):
+    s = load_strategy(folder, fname)
+    delta = TF[s['tf']][1]
+    a = pd.Timestamp(s['paused_at']) - delta                       # bars that closed during the pause are ignored
+    s.setdefault('gaps', []).append([a.strftime('%Y-%m-%d %H:%M:%S'), now_ist().strftime('%Y-%m-%d %H:%M:%S')])
+    s['paused_at'] = None
+    log_event(s, 'Resumed - candles that closed while paused are skipped')
+    save_strategy(folder, fname, s)
+
+
+def restart_strategy(folder, fname):
+    """Start again after Exit: fresh from NOW (old trades are cleared, event log is kept)."""
+    s = load_strategy(folder, fname)
+    for k in ('stopped', 'final', 'paused_at'):
+        s.pop(k, None)
+    s['gaps'] = []
+    s['start'] = now_ist().strftime('%Y-%m-%d %H:%M')
+    log_event(s, f"Started again from {s['start']}")
+    save_strategy(folder, fname, s)
+
+
+def next_candle_close(s, now):
+    ch, cm = [int(x) for x in s['close'].split(':')]
+    oh, om = (9, 0) if s['exchange'] == 'MCX' else (9, 15)
+    for i in range(8):
+        base = pd.Timestamp(now).normalize() + pd.Timedelta(days=i)
+        if base.weekday() >= 5:
+            continue
+        o, c = base + pd.Timedelta(hours=oh, minutes=om), base + pd.Timedelta(hours=ch, minutes=cm)
+        if s['tf'] == '1D':
+            times = [c]
+        elif s['tf'] == '4H':
+            times = [o + pd.Timedelta(hours=4), c]
+        else:
+            delta, times, x = TF[s['tf']][1], [], o + TF[s['tf']][1]
+            while x < c:
+                times.append(x)
+                x += delta
+            times.append(c)
+        for x in times:
+            if x > now:
+                return x
+    return None
+
+
+def csv_button(label, df, key):
+    st.download_button(label, df.to_csv(index=False).encode('utf-8'), file_name=f'{key}.csv', mime='text/csv', key=f'dl_{key}')
+
+
+def page_file(topic, refresh, fol, fname):
+    """One strategy on its own page: controls, settings, key numbers and separate tabs."""
+    if st.button('← Back to My Strategies'):
+        st.session_state.pop('open_file', None)
+        st.rerun()
+    try:
+        s0 = load_strategy(fol, fname)
+    except FileNotFoundError:
+        st.session_state.pop('open_file', None)
+        st.rerun()
+        return
+    st.markdown(f"# {fol} / {s0['name']}")
+
+    def body():
+        s = load_strategy(fol, fname)
+        state = strat_state(s)
+        b = st.columns([1, 1, 1, 1, 2.6])                              # ---- controls
+        with b[0].popover('Start', width='stretch', disabled=state != 'EXITED'):
+            st.write('Start again from now (old trades are cleared)')
+            if st.button('✔ Yes', key=f'rs_{fname}', type='primary'):
+                restart_strategy(fol, fname)
+                st.rerun()
+        if b[1].button('Resume', width='stretch', disabled=state != 'PAUSED'):
+            resume_strategy(fol, fname)
+            st.rerun()
+        if b[2].button('Stop', width='stretch', disabled=state != 'RUNNING'):
+            pause_strategy(fol, fname)
+            st.rerun()
+        with b[3].popover('Exit', width='stretch', disabled=state == 'EXITED'):
+            st.write('Close the open position at the last closed price and stop for good')
+            if st.button('✔ Yes', key=f'ex_{fname}', type='primary'):
+                try:
+                    ev_ = evaluate(s)
+                except Exception:
+                    ev_ = None
+                exit_strategy(fol, fname, ev_)
+                st.rerun()
+        b[4].markdown(f'Status: **{state}**')
+
+        size = f"amount/lot {s['amount']:,.0f}" if s.get('amount') else f"qty/lot {s['qty']:g}"
+        st.info(f"**{s['exchange']}** | {s['symbol']} | {s['tf']} | capital {s['capital']:,.0f} | max lots {s['lots']} | {size} | "
+                f"exit {exit_text(s)} | buy {candle_text(s).lower()} | started {s['start']}")
+
+        with st.expander('Edit settings (running-ah irundhaalum maathalaam)'):
+            e1, e2, e3 = st.columns(3)
+            ex_opts = EXIT_OPTIONS
+            cur_ex = s.get('span') and next(k for k, v in SPAN_OPTIONS.items() if v == s['span']) or s.get('profit')
+            new_ex = e1.selectbox('Exit', ex_opts, index=ex_opts.index(cur_ex) if cur_ex in ex_opts else 0,
+                                  format_func=exit_label, key=f'ed_ex_{fname}')
+            new_lots = e2.number_input('Max lots', 1, 1000, int(s['lots']), key=f'ed_lots_{fname}')
+            cds = list(CANDLE_OPTIONS)
+            cur_cd = next((k for k, v in CANDLE_OPTIONS.items() if v == s.get('candle', 'every')), cds[0])
+            new_cd = e3.selectbox('Buy on', cds, index=cds.index(cur_cd), key=f'ed_cd_{fname}')
+            e1, e2, e3 = st.columns(3)
+            by = e1.selectbox('Size each lot by', ['Quantity', 'Amount'], index=1 if s.get('amount') else 0, key=f'ed_by_{fname}')
+            val = e2.number_input('Quantity per lot' if by == 'Quantity' else 'Amount per lot', min_value=0.0,
+                                  value=float(s['amount'] if s.get('amount') else s['qty']), key=f'ed_val_{fname}_{by}')
+            new_cap = e3.number_input('Capital', min_value=0.0, value=float(s['capital']), step=10000.0, key=f'ed_cap_{fname}')
+            st.caption('Numbers are re-calculated from the start time with the new settings.')
+            if st.button('Save settings', key=f'ed_save_{fname}'):
+                s['lots'], s['capital'], s['candle'] = int(new_lots), new_cap, CANDLE_OPTIONS[new_cd]
+                s['profit'] = None if new_ex in SPAN_OPTIONS else new_ex
+                s['span'] = SPAN_OPTIONS.get(new_ex)
+                s['exit_label'] = exit_label(new_ex)
+                s['qty'], s['amount'] = (val, None) if by == 'Quantity' else (1.0, val)
+                log_event(s, f"Settings changed: exit {exit_label(new_ex)}, lots {new_lots}, {by.lower()} {val:g}, buy {new_cd}")
+                save_strategy(fol, fname, s)
+                st.rerun()
+
+        now = now_ist()
+        if state == 'EXITED':
+            f = s.get('final', {})
+            st.markdown(f"**EXITED** | {s['exchange']} | exited {f.get('at', '')} | timeframe: {s['tf']}")
+            m = st.columns(4)
+            m[0].metric('Open lots', f"0 / {s['lots']}")
+            m[1].metric('Closed trades', f.get('closed_n', 0))
+            m[2].metric('Realized P&L', f"{f.get('realized', 0.0):,.2f}")
+            m[3].metric('Unrealized P&L', '0.00')
+            ev = None
+        else:
+            try:
+                ev = evaluate(s)
+            except Exception as e:
+                st.error(f'Could not load data: {e}')
+                return
+            notify_new_signal(topic, f"{st.session_state['creds']['client_id']}/{fol}/{fname}", ev['last']) if ev['last'] is not None else None
+            open_txt = '09:00' if s['exchange'] == 'MCX' else '09:15'
+            is_open = now.weekday() < 5 and open_txt <= now.strftime('%H:%M') <= s.get('close', '15:30')
+            st.markdown(f"**{state}** | {s['exchange']} market **{'OPEN' if is_open else 'CLOSED'}** | now {now:%H:%M:%S} IST | "
+                        f"prices updated {ts_ist(ev['checked']).strftime('%H:%M:%S')} | timeframe: {s['tf']} | {size}")
+            nxt = next_candle_close(s, now)
+            if state == 'PAUSED':
+                st.caption(f"Engine: paused since {s['paused_at']} - press Resume to continue")
+            elif ev.get('data_err'):
+                st.warning('Angel rate limit / data problem - showing the last good candles, retrying on the next refresh: ' + ev['data_err'][:120])
+            else:
+                st.caption(f"Engine: Waiting for the next candle ({nxt:%H:%M}{'' if nxt.date() == now.date() else nxt.strftime(' %d %b')})" if nxt is not None else 'Engine: -')
+            last, tr, trades = ev['last'], ev['tr'], ev['trades']
+            closed = trades[~trades['Exit Reason'].str.startswith('Open at end')] if not trades.empty else trades
+            win = f"{(closed['PnL (pts x qty)'] > 0).mean() * 100:.0f}%" if len(closed) else '-'
+            m = st.columns(5)
+            m[0].metric('Open lots', f"{0 if last is None or ev['flat'] else int(last['Lots'])} / {s['lots']}")
+            m[1].metric('Closed trades', ev['closed_n'])
+            m[2].metric('Realized P&L', f"{ev['closed_pnl']:,.2f}")
+            m[3].metric('Unrealized P&L', f"{ev['open_pnl']:,.2f}")
+            m[4].metric('Win rate (closed)', win)
+
+        # ---- topics as tabs: click to view
+        tabs = st.tabs(['1. Monitoring', '2. Signals', '3. Live position', '4. Closed trades', '5. Logs'])
+        key = f'{fol}_{fname}'.replace(' ', '_')
+        with tabs[0]:
+            if ev is None or ev['last'] is None:
+                st.info('Waiting for the first closed candle after the start time (cloud needs 78+ bars of history).' if ev else 'Exited - monitoring stopped.')
+            else:
+                last = ev['last']
+                prev = ev['tr']['Close'].iloc[-2] if len(ev['tr']) > 1 else None
+                pos = 'Above cloud' if last['Close'] > last['CloudTop'] else ('Below cloud' if last['Close'] < last['CloudBottom'] else 'Inside cloud')
+                st.caption('last closed bar = latest finished candle | change_% = vs previous bar close | cloud = Ichimoku (9/26/52, shift 26)')
+                st.dataframe(pd.DataFrame([{'symbol': s['symbol'], 'last_bar': str(last['Date'])[:16], 'close': round(float(last['Close']), 2),
+                                            'change_%': round((last['Close'] / prev - 1) * 100, 2) if prev else None,
+                                            'cloud_top': round(float(last['CloudTop']), 2), 'cloud_bottom': round(float(last['CloudBottom']), 2),
+                                            'price_vs_cloud': pos, 'signal': last['Signal'],
+                                            'position': ev['status']}]), width='stretch', hide_index=True)
+                st.line_chart(ev['tr'].tail(150).set_index('Date')[['Close', 'CloudTop', 'CloudBottom']])
+        with tabs[1]:
+            if ev is None or ev['tr'].empty or (ev['tr']['Signal'] == 'HOLD').all():
+                st.info('No signal yet.')
+            else:
+                sg = ev['tr'][ev['tr']['Signal'] != 'HOLD'][['Date', 'Signal', 'Close', 'Lots', 'AvgPrice', 'Unrealised %']]
+                sg = sg.sort_values('Date', ascending=False)
+                st.dataframe(sg, width='stretch', hide_index=True)
+                csv_button('Download signals CSV', sg, f'signals_{key}')
+        with tabs[2]:
+            if ev is None or ev['last'] is None or ev['flat']:
+                st.write('Open position illa.')
+            else:
+                last = ev['last']
+                units = float(last['Qty'])
+                st.dataframe(pd.DataFrame([{'symbol': s['symbol'], 'lots': int(last['Lots']), 'avg_entry': round(float(last['AvgPrice']), 2),
+                                            'units': round(units, 4), 'invested': round(units * float(last['AvgPrice']), 2),
+                                            'last_close': round(float(last['Close']), 2), 'unrealised_%': last['Unrealised %'],
+                                            'unrealised_pnl': round(ev['open_pnl'], 2)}]), width='stretch', hide_index=True)
+        with tabs[3]:
+            if ev is None:
+                st.write(f"{s.get('final', {}).get('closed_n', 0)} trade(s) closed before exit (details are not kept after Exit).")
+            elif closed.empty:
+                st.write('No closed trades yet.')
+            else:
+                ct = closed.sort_values('Exit Date', ascending=False)
+                st.dataframe(ct, width='stretch', hide_index=True)
+                csv_button('Download closed trades CSV', ct, f'closed_{key}')
+        with tabs[4]:
+            evs_ = pd.DataFrame(s.get('events', []))
+            st.markdown('**Control events**')
+            st.dataframe(evs_.iloc[::-1] if not evs_.empty else pd.DataFrame([{'time': s.get('created', ''), 'event': 'Created'}]),
+                         width='stretch', hide_index=True)
+            if ev is not None and not ev['tr'].empty:
+                st.markdown('**Bar log (latest first)**')
+                bl = ev['tr'].sort_values('Date', ascending=False).head(300)
+                st.dataframe(bl, width='stretch', hide_index=True)
+                csv_button('Download bar log CSV', bl, f'barlog_{key}')
+
+    st.fragment(run_every=int(refresh))(body)()
 
 
 def make_folder():
@@ -794,11 +994,17 @@ def row_stats(s, ev, err):
         return {'state': 'Error', 'sub': (err or '')[:70], 'open_n': 0, 'closed_n': 0, 'realized': 0.0, 'unreal': 0.0}
     last = ev['last']
     holding = last is not None and not ev['flat']
-    return {'state': 'Running', 'sub': 'Waiting for 1st candle' if last is None else ev['status'],
+    return {'state': 'Paused' if s.get('paused_at') else 'Running', 'sub': 'Waiting for 1st candle' if last is None else ev['status'],
             'open_n': 1 if holding else 0, 'closed_n': ev['closed_n'], 'realized': ev['closed_pnl'], 'unreal': ev['open_pnl']}
 
 
 def page_view(topic, refresh):
+    of = st.session_state.get('open_file')
+    if of:
+        if os.path.exists(os.path.join(user_dir(), safe(of[0]), of[1])):
+            page_file(topic, refresh, of[0], of[1])
+            return
+        st.session_state.pop('open_file', None)
     st.markdown('# My Strategies')
 
     def body():
@@ -899,25 +1105,27 @@ def page_view(topic, refresh):
 
                 w = [3, 1.6, 2, 3.4, 0.7, 0.9, 0.7]
                 hd = st.columns(w)
-                for col, name in zip(hd, ['Name & details', 'Instrument', 'Status', 'P&L', 'Live', 'Exit', 'Del']):
+                for col, name in zip(hd, ['Name & details', 'Instrument', 'Status', 'P&L', 'Open', 'Exit', 'Del']):
                     col.markdown(f'<span style="opacity:.6;font-weight:600;font-size:14px">{name}</span>', unsafe_allow_html=True)
                 for f, s in files:
                     x = stats[f]
                     total = x['realized'] + x['unreal']
                     pct = total / float(s['capital']) * 100 if s.get('capital') else None
                     r = st.columns(w)
-                    r[0].markdown(f"📄 **{s['name']}**")
+                    if r[0].button(f"📄 {s['name']}", key=f'open_{fol}_{f}', type='tertiary'):
+                        st.session_state['open_file'] = (fol, f)
+                        st.rerun()
                     size = f"amount/lot {s['amount']:,.0f}" if s.get('amount') else f"qty/lot {s['qty']:g}"
                     r[0].caption(f"{s['exchange']} · {s['tf']} · {s['lots']} lots · exit {exit_text(s)} · {candle_text(s).lower()} · {size} · capital {s['capital']:g} · started {s['start']}")
                     r[1].write(s['symbol'])
-                    dot = {'Running': '🟢', 'Stopped': '⚫', 'Error': '🔴'}[x['state']]
+                    dot = {'Running': '🟢', 'Paused': '🟡', 'Stopped': '⚫', 'Error': '🔴'}[x['state']]
                     r[2].write(f"{dot} {x['state']}")
                     r[2].caption(x['sub'])
                     r[3].markdown(f"Open **{x['open_n']}** · Closed **{x['closed_n']}** · Realized {pnl_txt(x['realized'])}  \n"
                                   f"Unrealized {pnl_txt(x['unreal'])} · **Total** {pnl_txt(total, pct)}")
-                    key = f'show_{fol}_{f}'
-                    if r[4].button('📈', key=f'btn_{key}', help='Live details'):
-                        st.session_state[key] = not st.session_state.get(key, False)
+                    if r[4].button('📈', key=f'btn_{fol}_{f}', help='Open'):
+                        st.session_state['open_file'] = (fol, f)
+                        st.rerun()
                     with r[5].popover('Exit', width='stretch', disabled=s.get('stopped', False)):
                         st.write(s['name'])
                         if st.button('✔ Yes', key=f'exit_{fol}_{f}', type='primary'):
@@ -928,13 +1136,6 @@ def page_view(topic, refresh):
                         if st.button('✔ Yes', key=f'del_{fol}_{f}', type='primary'):
                             delete_strategy(fol, f)
                             st.rerun()
-                    if st.session_state.get(key):
-                        ev = evs.get((fol, f))
-                        with st.container(border=True):
-                            if ev is not None:
-                                detail(ev)
-                            else:
-                                st.info('Stopped - numbers are frozen.' if s.get('stopped') else f"Could not evaluate: {errs.get((fol, f), '')[:200]}")
                     st.divider()
 
     st.fragment(run_every=int(refresh))(body)()
@@ -979,6 +1180,7 @@ def main():
     n1, n2, _ = st.columns([1.3, 1.5, 4])
     if n1.button('📁 My Strategies', type='primary' if page == 'strategies' else 'secondary', width='stretch'):
         st.session_state['page'] = 'strategies'
+        st.session_state.pop('open_file', None)
         st.rerun()
     if n2.button('🛠️ Strategy Builder', type='primary' if page == 'builder' else 'secondary', width='stretch'):
         st.session_state['page'] = 'builder'
