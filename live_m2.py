@@ -581,140 +581,147 @@ def instrument_choices(exchange):
     return out
 
 
+def lbl(text):                                                # same label look for EVERY field -> rows line up
+    st.markdown(f"<div style='font-size:14px;line-height:1.5;padding:0 0 8px 0;opacity:.85'>{text}</div>", unsafe_allow_html=True)
+
+
+def section_title(title, hint=''):
+    st.markdown("<div style='display:flex;align-items:center;gap:10px;margin:2px 0 10px 0'>"
+                "<span style='width:5px;height:22px;background:#ff4b4b;border-radius:2px;display:inline-block'></span>"
+                f"<b style='font-size:17px'>{title}</b><span style='opacity:.6;font-size:13px'>{hint}</span></div>",
+                unsafe_allow_html=True)
+
+
+def typed_values(txt):
+    out = []
+    for x in txt.split(','):
+        try:
+            v = float(x.strip())
+        except ValueError:
+            continue
+        if v > 0 and v not in out:
+            out.append(v)
+    return out
+
+
 def page_builder():
-    st.subheader('Strategy builder - Method 2')
-    st.caption('Paper trading. Every Symbol x Max lots x Target % you pick is saved as its own file inside the folder.')
-    st.markdown("""<style>
-    div[data-testid='stVerticalBlock']{gap:.6rem}
-    /* check-box drop-downs look exactly like the other inputs (same grey, same height) */
-    div[data-testid='stPopover'] button{background:rgba(151,166,195,.15);border:1px solid transparent;
-        min-height:2.5rem;border-radius:.5rem}
-    div[data-testid='stPopover'] button:hover{border-color:rgba(255,75,75,.6)}
-    </style>""", unsafe_allow_html=True)
+    st.markdown('# Strategy Builder')
+    with st.container(border=True):
+        c1, c2 = st.columns(2)                                # ---- basic details
+        with c1:
+            lbl('Folder Name')
+            folder = st.selectbox('Folder Name', list_folders(), index=None, accept_new_options=True,
+                                  placeholder='Select or create a folder', label_visibility='collapsed')
+        with c2:
+            lbl('File Name')
+            prefix = st.text_input('File Name', label_visibility='collapsed', placeholder='e.g. NSE morning')
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            lbl('Exchange')
+            exchange = st.selectbox('Exchange', ['NSE', 'MCX', 'NFO', 'BSE'], label_visibility='collapsed')
+        with c2:
+            lbl('Capital')
+            capital = st.number_input('Capital', min_value=0.0, value=1000000.0, step=10000.0, label_visibility='collapsed')
+        with c3:
+            lbl('Candle timeframe (one file each)')
+            tfs = checkbox_dropdown('Select timeframe', list(TF), ['1D'], 'tf')
 
-    def lbl(text):                                            # same label look for EVERY field -> rows line up
-        st.markdown(f"<div style='font-size:14px;line-height:1.5;padding:0 0 10px 0;opacity:.85'>{text}</div>", unsafe_allow_html=True)
+        with st.container(border=True):                       # ---- ENTRY CONDITION
+            section_title('Entry condition', 'Ichimoku cloud, Method 2 - index, stocks, candle, position size (live: starts from now)')
+            picked = []
+            groups = list(instrument_choices(exchange).items())
+            cols = st.columns(len(groups) + 1)
+            for col, (label, opts) in zip(cols, groups):
+                with col:
+                    lbl(f'{label} ({len(opts)})')
+                    picked += checkbox_dropdown(f'Select {label.lower()}', opts, [], f'sym_{exchange}_{label}')
+            with cols[-1]:
+                lbl('Or type names (comma separated)')
+                typed_txt = st.text_input('Or type names', label_visibility='collapsed',
+                                          placeholder='Nifty 50, RELIANCE, GOLDM05DEC25FUT',
+                                          help='Index: Nifty 50  |  Stock: RELIANCE (or RELIANCE-EQ)  |  MCX: exact future symbol. '
+                                               'Typed names are added to the ticked ones.')
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                lbl('Max lots (one file each)')
+                lots_list = checkbox_dropdown('Select lots', LOTS_OPTIONS, [10], 'lots')
+            with c2:
+                lbl('Buy on (one file each)')
+                candles = checkbox_dropdown('Select candle', list(CANDLE_OPTIONS), ['Every candle'], 'candle')
+            with c3:
+                lbl('Market close')
+                close_t = st.time_input('Market close', dt.time(23, 30) if exchange == 'MCX' else dt.time(15, 30),
+                                        key=f'close_{exchange}', label_visibility='collapsed')
+            c = st.columns(3)
+            with c[0]:
+                lbl('Position - size each lot by')
+                modes = checkbox_dropdown('Select position type', ['Quantity', 'Amount'], ['Quantity'], 'mode')
+            sizes, blocks = [], []
+            if 'Quantity' in modes:
+                blocks.append('qty')
+            if 'Amount' in modes:
+                blocks.append('amt')
+            for i, kind in enumerate(blocks):
+                row = c if i == 0 else st.columns(3)
+                a_, b_ = (1, 2) if i == 0 else (0, 1)
+                if kind == 'qty':
+                    with row[a_]:
+                        lbl('Quantity per lot')
+                        vals = [float(q) for q in checkbox_dropdown('Select quantity', QTY_OPTIONS, [1], 'qty')]
+                    with row[b_]:
+                        lbl('Or type quantity')
+                        vals += typed_values(st.text_input('Or type quantity', label_visibility='collapsed',
+                                                           placeholder='3, 15, 40', key='size_txt_qty'))
+                else:
+                    with row[a_]:
+                        lbl('Amount per lot')
+                        vals = [float(q) for q in checkbox_dropdown('Select amount', AMOUNT_OPTIONS, [10000], 'amt')]
+                    with row[b_]:
+                        lbl('Or type amount')
+                        vals += typed_values(st.text_input('Or type amount', label_visibility='collapsed',
+                                                           placeholder='15000, 75000', key='size_txt_amt',
+                                                           help='Money put in every lot (units = amount / price of that lot).'))
+                sizes += [(kind, v) for v in dict.fromkeys(vals)]
 
-    folders = list_folders()
-    c1, c2, c3, c4 = st.columns(4)                            # ---- row 1
-    with c1:
-        lbl('Folder')
-        pick = st.selectbox('Folder', ['+ New folder'] + folders, label_visibility='collapsed')
-    with c2:
-        lbl('New folder name')
-        new_name = st.text_input('New folder name', label_visibility='collapsed', placeholder='e.g. Nifty 4H test',
-                                 disabled=(pick != '+ New folder'))
-    with c3:
-        lbl('File name prefix')
-        prefix = st.text_input('File name prefix', label_visibility='collapsed', placeholder='optional, e.g. morning')
-    with c4:
-        lbl('Exchange')
-        exchange = st.selectbox('Exchange', ['NSE', 'MCX', 'NFO', 'BSE'], label_visibility='collapsed')
-    folder = new_name if pick == '+ New folder' else pick
+        with st.container(border=True):                       # ---- EXIT CONDITION
+            section_title('Exit condition', 'profit target % on average entry, or Span exit')
+            c = st.columns(3)
+            with c[0]:
+                lbl(f'Profit target / Span exit ({len(EXIT_OPTIONS)}) (one file each)')
+                targets = checkbox_dropdown('Select exit', EXIT_OPTIONS, [1, 2], 'exits', fmt=exit_label)
 
-    c1, c2, c3, c4 = st.columns(4)                            # ---- row 2
-    with c1:
-        lbl('Capital')
-        capital = st.number_input('Capital', min_value=0.0, value=1000000.0, step=10000.0, label_visibility='collapsed')
-    with c2:
-        lbl('Timeframe (one file each)')
-        tfs = checkbox_dropdown('Select timeframe', list(TF), ['1D'], 'tf')
-    with c3:
-        lbl('Market close')
-        close_t = st.time_input('Market close', dt.time(23, 30) if exchange == 'MCX' else dt.time(15, 30),
-                                key=f'close_{exchange}', label_visibility='collapsed')
-    with c4:
-        lbl('Buy on (one file each)')
-        candles = checkbox_dropdown('Select candle', list(CANDLE_OPTIONS), ['Every candle'], 'candle')
-
-    st.markdown('**Entry condition**  - Ichimoku cloud, Method 2 (live: starts from now)')
-    picked = []
-    groups = list(instrument_choices(exchange).items())
-    cols = st.columns(len(groups) + 1)                        # ---- row 3: Index | Stocks | type names
-    for col, (label, opts) in zip(cols, groups):
-        with col:
-            lbl(f'{label} ({len(opts)})')
-            picked += checkbox_dropdown(f'Select {label.lower()}', opts, [], f'sym_{exchange}_{label}')
-    with cols[-1]:
-        lbl('Or type names (comma separated)')
-        typed_txt = st.text_input('Or type names', label_visibility='collapsed', placeholder='Nifty 50, RELIANCE, GOLDM05DEC25FUT',
-                                  help='Index: Nifty 50  |  Stock: RELIANCE (or RELIANCE-EQ)  |  MCX: exact future symbol. '
-                                       'Typed names are added to the ticked ones.')
-
-    c1, c2, c3, c4 = st.columns(4)                            # ---- row 4: lots | size by | exit
-    with c1:
-        lbl('Max lots (one file each)')
-        lots_list = checkbox_dropdown('Select lots', LOTS_OPTIONS, [10], 'lots')
-    with c2:
-        lbl('Size each lot by')
-        modes = checkbox_dropdown('Select size type', ['Quantity', 'Amount'], ['Quantity'], 'mode')
-    with c3:
-        lbl(f'Profit target / Span exit ({len(EXIT_OPTIONS)})')
-        targets = checkbox_dropdown('Select exit', EXIT_OPTIONS, [1, 2], 'exits', fmt=exit_label)
-
-    def typed_values(txt):
-        out = []
-        for x in txt.split(','):
-            try:
-                v = float(x.strip())
-            except ValueError:
-                continue
-            if v > 0 and v not in out:
-                out.append(v)
-        return out
-
-    sizes = []
-    slots = st.columns(4)                                     # ---- row 5: values for the chosen size type(s)
-    i = 0
-    if 'Quantity' in modes:
-        with slots[i]:
-            lbl('Quantity per lot')
-            qv = [float(q) for q in checkbox_dropdown('Select quantity', QTY_OPTIONS, [1], 'qty')]
-        with slots[i + 1]:
-            lbl('Or type quantity')
-            qt = st.text_input('Or type quantity', label_visibility='collapsed', placeholder='3, 15, 40', key='size_txt_qty')
-        sizes += [('qty', v) for v in dict.fromkeys(qv + typed_values(qt))]
-        i += 2
-    if 'Amount' in modes:
-        with slots[i]:
-            lbl('Amount per lot')
-            av = [float(q) for q in checkbox_dropdown('Select amount', AMOUNT_OPTIONS, [10000], 'amt')]
-        with slots[i + 1]:
-            lbl('Or type amount')
-            at = st.text_input('Or type amount', label_visibility='collapsed', placeholder='15000, 75000', key='size_txt_amt',
-                               help='Money put in every lot (units = amount / price of that lot).')
-        sizes += [('amt', v) for v in dict.fromkeys(av + typed_values(at))]
-    start = now_ist().strftime('%Y-%m-%d %H:%M')    # live only: always start from NOW (no past backfill)
-
-    symbols, seen = [], set()
-    for x in picked + [t.strip() for t in typed_txt.split(',') if t.strip()]:
-        if x.upper() not in seen:
-            seen.add(x.upper())
-            symbols.append(x)
-    n = len(symbols) * len(tfs) * len(lots_list) * len(sizes) * len(targets) * len(candles)
-    st.caption(f'{len(symbols)} symbol(s) x {len(tfs)} timeframe(s) x {len(lots_list)} lots x {len(sizes)} size(s) x {len(targets)} exits x '
-               f'{len(candles)} candle mode(s) = {n} file(s) will be saved.  Start = {start}  (live - first candle that closes after this)')
-    st.caption('Live trading (real orders) is not included - run Paper first and check the numbers.')
-    if st.button('Start', type='primary'):
-        if not folder or not folder.strip():
-            st.error('Give a folder name.')
-        elif n == 0:
-            st.error('Pick (or type) at least one symbol, one timeframe, one Max lots, one quantity/amount, one candle option and one exit option.')
-        elif n > 150:
-            st.error('Too many files (max 150 at a time).')
-        else:
-            try:
-                for sym in symbols:
-                    _instrument_token(exchange, sym)          # fail early if a symbol is wrong
-            except Exception as e:
-                st.error(str(e))
-                return
-            made, skipped = create_strategies(folder.strip(), prefix.strip(), exchange, symbols, tfs, capital, sizes,
-                                              close_t.strftime('%H:%M'), lots_list, targets, candles, start)
-            if made:
-                st.success(f'Saved {len(made)} file(s) in folder "{folder.strip()}". Open "My strategies" to watch them live.')
-            if skipped:
-                st.warning(f'{len(skipped)} file(s) already existed and were kept as they are (their start time is unchanged).')
+        start = now_ist().strftime('%Y-%m-%d %H:%M')          # live only: always start from NOW (no past backfill)
+        symbols, seen = [], set()
+        for x in picked + [t.strip() for t in typed_txt.split(',') if t.strip()]:
+            if x.upper() not in seen:
+                seen.add(x.upper())
+                symbols.append(x)
+        n = len(symbols) * len(tfs) * len(lots_list) * len(sizes) * len(targets) * len(candles)
+        st.caption(f'{len(symbols)} symbol(s) x {len(tfs)} timeframe(s) x {len(lots_list)} lots x {len(sizes)} size(s) x '
+                   f'{len(targets)} exits x {len(candles)} candle mode(s) = {n} file(s) will be saved.  Start = {start}  '
+                   f'(live - first candle that closes after this)')
+        st.caption('Live trading (real orders) is not included - run Paper first and check the numbers.')
+        if st.button('▶ Start', type='primary'):
+            fname = (folder or '').strip()
+            if not fname:
+                st.error('Give a folder name.')
+            elif n == 0:
+                st.error('Pick (or type) at least one symbol, timeframe, Max lots, quantity/amount, candle option and exit option.')
+            elif n > 150:
+                st.error('Too many files (max 150 at a time).')
+            else:
+                try:
+                    for sym in symbols:
+                        _instrument_token(exchange, sym)      # fail early if a symbol is wrong
+                except Exception as e:
+                    st.error(str(e))
+                    return
+                made, skipped = create_strategies(fname, (prefix or '').strip(), exchange, symbols, tfs, capital, sizes,
+                                                  close_t.strftime('%H:%M'), lots_list, targets, candles, start)
+                if made:
+                    st.success(f'Saved {len(made)} file(s) in folder "{fname}". Open "My Strategies" to watch them live.')
+                if skipped:
+                    st.warning(f'{len(skipped)} file(s) already existed and were kept as they are (their start time is unchanged).')
 
 
 def detail(ev):
@@ -751,145 +758,204 @@ def detail(ev):
             st.dataframe(trades.sort_values('Exit Date', ascending=False), width='stretch', hide_index=True)
 
 
+def save_strategy(folder, fname, s):
+    with open(os.path.join(user_dir(), safe(folder), fname), 'w', encoding='utf-8') as f:
+        json.dump(s, f, indent=1)
+
+
+def exit_strategy(folder, fname, ev):
+    """Stop a strategy: open position is squared off at the last closed price and the numbers are frozen."""
+    s = load_strategy(folder, fname)
+    s['stopped'] = True
+    s['final'] = {'closed_n': ev['closed_n'] + (1 if ev['last'] is not None and not ev['flat'] else 0) if ev else 0,
+                  'realized': (ev['closed_pnl'] + ev['open_pnl']) if ev else 0.0,
+                  'at': now_ist().strftime('%Y-%m-%d %H:%M')}
+    save_strategy(folder, fname, s)
+
+
+def make_folder():
+    name = st.session_state.get('new_folder_name', '').strip()
+    if name:
+        os.makedirs(os.path.join(user_dir(), safe(name)), exist_ok=True)
+    st.session_state['new_folder_name'] = ''
+
+
+def pnl_txt(x, pct=None):
+    col = 'green' if x > 0 else ('red' if x < 0 else 'gray')
+    return f":{col}[{x:,.2f}]" + ('' if pct is None else f" ({pct:+.2f}%)")
+
+
+def row_stats(s, ev, err):
+    if s.get('stopped'):
+        f = s.get('final', {})
+        return {'state': 'Stopped', 'sub': f"exited {f.get('at', '')}", 'open_n': 0, 'closed_n': f.get('closed_n', 0),
+                'realized': f.get('realized', 0.0), 'unreal': 0.0}
+    if ev is None:
+        return {'state': 'Error', 'sub': (err or '')[:70], 'open_n': 0, 'closed_n': 0, 'realized': 0.0, 'unreal': 0.0}
+    last = ev['last']
+    holding = last is not None and not ev['flat']
+    return {'state': 'Running', 'sub': 'Waiting for 1st candle' if last is None else ev['status'],
+            'open_n': 1 if holding else 0, 'closed_n': ev['closed_n'], 'realized': ev['closed_pnl'], 'unreal': ev['open_pnl']}
+
+
 def page_view(topic, refresh):
-    folders = list_folders()
-    if not folders:
-        st.info('No strategies yet. Create some in the Builder.')
-        return
-    folder = st.session_state.get('open_folder')
-    if folder not in folders:
-        st.session_state.pop('open_folder', None)
-        folder = None
+    st.markdown('# My Strategies')
 
-    if folder is None:                                            # ---- folder list: click a folder to open it
-        st.markdown('#### Your folders')
-        st.caption('Click a folder to watch its strategies run live.')
-        for fol in folders:
-            n = len(list_files(fol))
-            row = st.columns([14, 1])
-            if row[0].button(f'📁  {fol}      |      {n} strateg{"y" if n == 1 else "ies"}', key=f'open_{fol}', width='stretch'):
-                st.session_state['open_folder'] = fol
-                st.rerun()
-            with row[1].popover('🗑️', width='stretch'):          # icon only; one more click to confirm
-                st.write(f'{fol} ({n})')
-                if st.button('✔ Yes', key=f'delfbtn_{fol}', type='primary'):
-                    delete_folder(fol)
-                    st.rerun()
-        return
-
-    top = st.columns([1.3, 8, 0.7])                               # ---- inside one folder
-    if top[0].button('← All folders'):
-        st.session_state.pop('open_folder', None)
-        st.rerun()
-    top[1].markdown(f'#### 📁 {folder}')
-    with top[2].popover('🗑️', width='stretch'):
-        st.write(f'{folder} ({len(list_files(folder))})')
-        if st.button('✔ Yes', key=f'delfbtn_in_{folder}', type='primary'):
-            delete_folder(folder)
-            st.session_state.pop('open_folder', None)
-            st.rerun()
-    _folder_live(topic, refresh, folder)
-
-
-def _folder_live(topic, refresh, folder):
     def body():
-        files = list_files(folder)
-        if not files:
-            st.info('This folder is empty.')
+        c1, c2 = st.columns(2)
+        query = c1.text_input('Search', placeholder='🔍 Search folder / strategy...', label_visibility='collapsed').strip().lower()
+        with c2.container(border=True):
+            n1, n2 = st.columns([4, 1.3])
+            n1.text_input('New folder', key='new_folder_name', placeholder='Enter new folder name', label_visibility='collapsed')
+            n2.button('📁 + Create', type='primary', width='stretch', on_click=make_folder)
+        status_ph = st.empty()
+
+        folders = list_folders()
+        data = {}
+        for fol in folders:                                        # load every strategy file
+            data[fol] = [(f, load_strategy(fol, f)) for f in list_files(fol)]
+        shown = [fol for fol in folders if not query or query in fol.lower()
+                 or any(query in s['name'].lower() for _, s in data[fol])]
+        if not folders:
+            st.info('No folders yet. Create one above or in Strategy Builder.')
             return
-        strategies = [load_strategy(folder, f) for f in files]
+
         evs, errs = {}, {}
-        for f, s in zip(files, strategies):
-            try:
-                evs[f] = evaluate(s)
-            except Exception as e:
-                errs[s['name']] = str(e)
-        for f, ev in evs.items():                                  # push alert on a NEW closed-candle signal
+        for fol in shown:                                          # evaluate (candles are cached, only newest ones refetched)
+            for f, s in data[fol]:
+                if s.get('stopped'):
+                    continue
+                try:
+                    evs[(fol, f)] = evaluate(s)
+                except Exception as e:
+                    errs[(fol, f)] = str(e)
+        for (fol, f), ev in evs.items():                           # push alert on a NEW closed-candle signal
             if ev['last'] is not None:
-                notify_new_signal(topic, f"{st.session_state['creds']['client_id']}/{folder}/{f}", ev['last'])
+                notify_new_signal(topic, f"{st.session_state['creds']['client_id']}/{fol}/{f}", ev['last'])
 
-        # ---- live status banner: shows the app is really running
+        # ---- one-line live status
         now = now_ist().to_pydatetime()
-        close_txt = strategies[0].get('close', '15:30')
-        open_txt = '09:00' if strategies[0]['exchange'] == 'MCX' else '09:15'
-        is_open = now.weekday() < 5 and open_txt <= now.strftime('%H:%M') <= close_txt
-        stale = [ev for ev in evs.values() if ev.get('data_err')]
-        ok = not (errs or stale)
-        b1, b2, b3, b4 = st.columns(4)
-        b1.metric('Status', 'LIVE',
-                  ('market open' if is_open else 'market closed') + (' - running' if ok else ' - check warnings'), delta_color='off' if ok else 'inverse')
-        b2.metric('Last refresh', now.strftime('%H:%M:%S'), f'next in {int(refresh)}s', delta_color='off')
-        checks = [ev['checked'] for ev in evs.values() if ev.get('checked')]
-        b3.metric('Angel data checked', ts_ist(max(checks)).strftime('%H:%M:%S') if checks else '-',
-                  f'{len(evs)} / {len(files)} files OK', delta_color='off')
-        n_sig = sum(int((ev['tr']['Signal'] != 'HOLD').sum()) for ev in evs.values() if not ev['tr'].empty)
-        b4.metric('Signals since start', n_sig)
-        if stale:
-            st.warning('Angel rate limit / data problem - showing the last good candles, will retry on the next refresh: '
-                       + (stale[0]['data_err'] or '')[:150])
-        if errs:
-            with st.expander(f'{len(errs)} file(s) could not be evaluated', expanded=False):
-                for n_, m_ in errs.items():
-                    st.write(f'**{n_}**: {m_[:200]}')
+        any_s = next((s for fol in shown for _, s in data[fol] if not s.get('stopped')), None)
+        if any_s is None:
+            status_ph.caption(f'Refreshed {now:%H:%M:%S}  |  no running strategy')
+        else:
+            open_txt = '09:00' if any_s['exchange'] == 'MCX' else '09:15'
+            is_open = now.weekday() < 5 and open_txt <= now.strftime('%H:%M') <= any_s.get('close', '15:30')
+            stale = [ev for ev in evs.values() if ev.get('data_err')]
+            checks = [ev['checked'] for ev in evs.values() if ev.get('checked')]
+            msg = (f"🟢 **LIVE**  |  market {'open' if is_open else 'closed'}  |  refreshed {now:%H:%M:%S} (every {int(refresh)}s)  |  "
+                   f"Angel data checked {ts_ist(max(checks)).strftime('%H:%M:%S') if checks else '-'}  |  {len(evs)} running file(s) OK")
+            if errs or stale:
+                msg += f"  |  ⚠️ {len(errs)} error(s), {len(stale)} using last good data (Angel rate limit?)"
+            status_ph.markdown(msg)
 
-        # ---- live activity feed (every BUY / EXIT since the strategies started)
-        acts = []
-        for f, ev in evs.items():
-            tr = ev['tr']
-            if tr.empty:
-                continue
-            for _, r in tr[tr['Signal'] != 'HOLD'].iterrows():
-                acts.append({'Bar time': str(r['Date'])[:16], 'File': ev['s']['name'], 'Signal': r['Signal'],
-                             'Price': round(float(r['Close']), 2), 'Lots after': int(r['Lots'])})
-        with st.expander(f'Live activity - {len(acts)} signal(s) since start', expanded=True):
-            if acts:
-                st.dataframe(pd.DataFrame(acts).sort_values('Bar time', ascending=False).head(100),
-                             width='stretch', hide_index=True)
-            else:
-                st.info('No signal yet. Strategies started at ' + min(s['start'] for s in strategies) +
-                        ' - they act only when a candle CLOSES after that time (cloud history is loaded automatically).')
-        st.caption(f"Refreshed {now:%H:%M:%S}  |  closed candles only  |  every {refresh}s")
-
-        tot = sum(ev['closed_pnl'] + ev['open_pnl'] for ev in evs.values())
-        st.metric('Folder total P&L (all files)', money(tot))
-        st.markdown(f'**Strategies in "{folder}"** ({len(files)}) - click "Live details" under a strategy to watch it run')
-
-        for f in files:                                            # one card per file, one below another
-            ev = evs.get(f)
-            if ev is None:
-                continue
-            s, last = ev['s'], ev['last']
-            total = ev['closed_pnl'] + ev['open_pnl']
-            icon = '⏳' if last is None else ('⚪' if ev['flat'] else '🟢')
-            with st.container(border=True):
-                c = st.columns([3.2, 1.5, 1.2, 1.2, 1.3])
-                c[0].markdown(f"**{icon} {s['name']}**")
-                c[0].caption(f"{s['exchange']}:{s['symbol']} | {s['tf']} | exit {exit_text(s)} | {candle_text(s).lower()} | started {s['start']}")
-                c[1].caption('Status')
-                c[1].write(ev['status'])
-                c[2].caption('Avg entry')
-                c[2].write('-' if last is None or ev['flat'] else f"{last['AvgPrice']:.2f}")
-                c[3].caption('Close')
-                c[3].write('-' if last is None else f"{last['Close']:.2f}")
-                c[4].caption('Total P&L')
-                c[4].write(money(total))
-                with st.expander('Live details'):                  # constant label -> stays open while it auto-refreshes
-                    detail(ev)
+        for fol in shown:
+            files = data[fol]
+            running = sum(1 for _, s in files if not s.get('stopped'))
+            with st.expander(f'📁 {fol} · Running {running} · Total {len(files)}'):
+                if not files:
+                    st.caption('Indha folder-la file illa. Strategy Builder-la file create pannunga.')
                     with st.popover('🗑️'):
-                        if st.button('✔ Yes', key=f'delbtn_{folder}_{f}', type='primary'):
-                            delete_strategy(folder, f)
+                        if st.button('✔ Yes', key=f'delfol_{fol}', type='primary'):
+                            delete_folder(fol)
                             st.rerun()
+                    continue
+                stats = {f: row_stats(s, evs.get((fol, f)), errs.get((fol, f))) for f, s in files}
+                o = sum(x['open_n'] for x in stats.values())
+                cl = sum(x['closed_n'] for x in stats.values())
+                real = sum(x['realized'] for x in stats.values())
+                unreal = sum(x['unreal'] for x in stats.values())
+                cap = sum(float(s.get('capital') or 0) for _, s in files)
+                h = st.columns([6, 1.4, 0.7])
+                h[0].markdown('**Folder P&L**')
+                h[0].markdown(f"Open **{o}** · Closed **{cl}** · Realized {pnl_txt(real)}  \n"
+                              f"Unrealized {pnl_txt(unreal)} · **Total** {pnl_txt(real + unreal, (real + unreal) / cap * 100 if cap else None)}")
+                with h[1].popover('Exit folder', width='stretch'):
+                    st.write(f'{fol} - stop all running ({running})')
+                    if st.button('✔ Yes', key=f'exitfol_{fol}', type='primary'):
+                        for f, s in files:
+                            if not s.get('stopped'):
+                                exit_strategy(fol, f, evs.get((fol, f)))
+                        st.rerun()
+                with h[2].popover('🗑️', width='stretch'):
+                    st.write(f'{fol} ({len(files)})')
+                    if st.button('✔ Yes', key=f'delfol_{fol}', type='primary'):
+                        delete_folder(fol)
+                        st.rerun()
+
+                acts = []                                          # latest BUY / EXIT signals since the files started
+                for f, s in files:
+                    ev = evs.get((fol, f))
+                    if ev is not None and not ev['tr'].empty:
+                        for _, r in ev['tr'][ev['tr']['Signal'] != 'HOLD'].iterrows():
+                            acts.append({'Bar time': str(r['Date'])[:16], 'Strategy': s['name'], 'Signal': r['Signal'],
+                                         'Price': round(float(r['Close']), 2), 'Lots after': int(r['Lots'])})
+                if acts:
+                    st.caption(f'Latest signals ({len(acts)} since start)')
+                    st.dataframe(pd.DataFrame(acts).sort_values('Bar time', ascending=False).head(8), width='stretch', hide_index=True)
+                else:
+                    st.caption('No signal yet - a strategy acts only when a candle CLOSES after its start time.')
+                st.divider()
+
+                w = [3, 1.6, 2, 3.4, 0.7, 0.9, 0.7]
+                hd = st.columns(w)
+                for col, name in zip(hd, ['Name & details', 'Instrument', 'Status', 'P&L', 'Live', 'Exit', 'Del']):
+                    col.markdown(f'<span style="opacity:.6;font-weight:600;font-size:14px">{name}</span>', unsafe_allow_html=True)
+                for f, s in files:
+                    x = stats[f]
+                    total = x['realized'] + x['unreal']
+                    pct = total / float(s['capital']) * 100 if s.get('capital') else None
+                    r = st.columns(w)
+                    r[0].markdown(f"📄 **{s['name']}**")
+                    size = f"amount/lot {s['amount']:,.0f}" if s.get('amount') else f"qty/lot {s['qty']:g}"
+                    r[0].caption(f"{s['exchange']} · {s['tf']} · {s['lots']} lots · exit {exit_text(s)} · {candle_text(s).lower()} · {size} · capital {s['capital']:g} · started {s['start']}")
+                    r[1].write(s['symbol'])
+                    dot = {'Running': '🟢', 'Stopped': '⚫', 'Error': '🔴'}[x['state']]
+                    r[2].write(f"{dot} {x['state']}")
+                    r[2].caption(x['sub'])
+                    r[3].markdown(f"Open **{x['open_n']}** · Closed **{x['closed_n']}** · Realized {pnl_txt(x['realized'])}  \n"
+                                  f"Unrealized {pnl_txt(x['unreal'])} · **Total** {pnl_txt(total, pct)}")
+                    key = f'show_{fol}_{f}'
+                    if r[4].button('📈', key=f'btn_{key}', help='Live details'):
+                        st.session_state[key] = not st.session_state.get(key, False)
+                    with r[5].popover('Exit', width='stretch', disabled=s.get('stopped', False)):
+                        st.write(s['name'])
+                        if st.button('✔ Yes', key=f'exit_{fol}_{f}', type='primary'):
+                            exit_strategy(fol, f, evs.get((fol, f)))
+                            st.rerun()
+                    with r[6].popover('🗑️', width='stretch'):
+                        st.write(s['name'])
+                        if st.button('✔ Yes', key=f'del_{fol}_{f}', type='primary'):
+                            delete_strategy(fol, f)
+                            st.rerun()
+                    if st.session_state.get(key):
+                        ev = evs.get((fol, f))
+                        with st.container(border=True):
+                            if ev is not None:
+                                detail(ev)
+                            else:
+                                st.info('Stopped - numbers are frozen.' if s.get('stopped') else f"Could not evaluate: {errs.get((fol, f), '')[:200]}")
+                    st.divider()
 
     st.fragment(run_every=int(refresh))(body)()
 
 
 # =============================================================== app
+GLOBAL_CSS = """<style>
+div[data-testid='stVerticalBlock']{gap:.6rem}
+/* check-box drop-downs look exactly like the other inputs (same grey, same height) */
+div[data-testid='stPopover'] button{background:rgba(151,166,195,.15);border:1px solid transparent;min-height:2.5rem;border-radius:.5rem}
+div[data-testid='stPopover'] button:hover{border-color:rgba(255,75,75,.6)}
+</style>"""
+
+
 def main():
     st.set_page_config(page_title='Live Paper Trading', layout='wide')
-    st.title('Live Paper Trading - Method 2')
+    st.markdown(GLOBAL_CSS, unsafe_allow_html=True)
 
     # ---- login screen (nothing is stored on the server)
     if 'creds' not in st.session_state:
+        st.title('Live Paper Trading - Method 2')
         st.subheader('Enter your Angel One details')
         api_key = st.text_input('API key', type='password')
         client_id = st.text_input('Client ID')
@@ -909,21 +975,30 @@ def main():
                 st.error(f'Login failed: {e}')
         return
 
-    with st.sidebar:
-        with st.expander('Account', expanded=False):
-            st.write(f"Client ID: {st.session_state['creds']['client_id']}")
-            topic = st.text_input('ntfy topic (optional)')
-            refresh = st.number_input('Refresh every (seconds)', 15, 3600, 60, 15)
-            if st.button('Logout / change details'):
-                for k_ in ('creds', 'smart'):
-                    st.session_state.pop(k_, None)
-                st.rerun()
+    page = st.session_state.setdefault('page', 'strategies')      # ---- top navigation
+    n1, n2, _ = st.columns([1.3, 1.5, 4])
+    if n1.button('📁 My Strategies', type='primary' if page == 'strategies' else 'secondary', width='stretch'):
+        st.session_state['page'] = 'strategies'
+        st.rerun()
+    if n2.button('🛠️ Strategy Builder', type='primary' if page == 'builder' else 'secondary', width='stretch'):
+        st.session_state['page'] = 'builder'
+        st.rerun()
+    st.divider()
 
-    page = st.radio('Page', ['Builder', 'My strategies'], horizontal=True, label_visibility='collapsed')
-    if page == 'Builder':
+    if page == 'builder':
         page_builder()
     else:
-        page_view(topic, refresh)
+        page_view(st.session_state.get('ntfy_topic', ''), st.session_state.get('refresh_secs', 60))
+
+    st.write('')
+    with st.expander('⚙️ Account'):
+        st.write(f"Client ID: {st.session_state['creds']['client_id']}")
+        st.text_input('ntfy topic (optional)', key='ntfy_topic')
+        st.number_input('Refresh every (seconds)', 15, 3600, 60, 15, key='refresh_secs')
+        if st.button('Logout / change details'):
+            for k_ in ('creds', 'smart'):
+                st.session_state.pop(k_, None)
+            st.rerun()
 
 
 if __name__ == '__main__':
