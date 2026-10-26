@@ -493,6 +493,19 @@ def get_candles(s):
         return load_candles(relogin(), s['exchange'], s['symbol'], s['tf'], day)   # session expired?
 
 
+def first_bar_after_start(df, tf, close_t, start):
+    """Date of the first bar that CLOSES after the start time (None if no such closed bar yet).
+    Bars that were already closed at start never trade. (Old code compared the bar OPEN time with the
+    start, so a bar that was running at start - e.g. today's daily candle - was wrongly ignored.)"""
+    if df.empty:
+        return None
+    bar = pd.Timedelta(hours=4) if tf == '4H' else TF[tf][1]
+    sess_end = df['Date'].dt.normalize() + pd.Timedelta(hours=close_t.hour, minutes=close_t.minute)
+    end = pd.concat([df['Date'] + bar, sess_end], axis=1).min(axis=1)
+    ok = df[end > pd.Timestamp(start)]
+    return None if ok.empty else ok['Date'].iloc[0]
+
+
 def evaluate(s):
     """-> dict with tr (bar log), trades and the numbers shown in the summary."""
     h, m = [int(x) for x in s['close'].split(':')]
@@ -500,9 +513,19 @@ def evaluate(s):
     now = pd.Timestamp(s['paused_at']) if s.get('paused_at') else now_ist()      # paused = frozen as of that moment
     df = prepare(raw, s['tf'], dt.time(h, m), now)
     skip = [(pd.Timestamp(a), pd.Timestamp(b)) for a, b in s.get('gaps', [])]
-    tr, trades = compute_m2(df, s.get('profit') or 0.0, int(s['lots']), s['start'], s['qty'],
-                            span=s.get('span'), candle=s.get('candle', 'every'), amount=s.get('amount'), skip=skip)
-    out = {'s': s, 'tr': tr, 'trades': trades, 'status': 'Waiting for 1st candle', 'last': None,
+    eff_start = first_bar_after_start(df, s['tf'], dt.time(h, m), s['start'])
+    tr, trades = compute_m2(df, s.get('profit') or 0.0, int(s['lots']), eff_start if eff_start is not None else pd.Timestamp('2100-01-01'),
+                            s['qty'], span=s.get('span'), candle=s.get('candle', 'every'), amount=s.get('amount'), skip=skip)
+    diag = {'bars': len(df), 'last_bar': None if df.empty else df['Date'].iloc[-1], 'cloud': None}
+    if len(df):
+        try:
+            cl = add_ichimoku_cloud(df).iloc[-1]
+            if not (pd.isna(cl['CloudTop']) or pd.isna(cl['CloudBottom'])):
+                diag['cloud'] = {'close': float(cl['Close']), 'top': float(cl['CloudTop']), 'bottom': float(cl['CloudBottom']),
+                                 'pos': 'Above cloud' if cl['Close'] > cl['CloudTop'] else ('Below cloud' if cl['Close'] < cl['CloudBottom'] else 'Inside cloud')}
+        except Exception:
+            pass
+    out = {'s': s, 'diag': diag, 'tr': tr, 'trades': trades, 'status': 'Waiting for 1st candle', 'last': None,
            'checked': checked, 'data_err': data_err,
            'closed_n': 0, 'closed_pnl': 0.0, 'open_pnl': 0.0, 'invested': 0.0}
     if tr.empty:
@@ -919,8 +942,22 @@ def page_file(topic, refresh, fol, fname):
         tabs = st.tabs(['1. Monitoring', '2. Signals', '3. Live position', '4. Closed trades', '5. Logs'])
         key = f'{fol}_{fname}'.replace(' ', '_')
         with tabs[0]:
-            if ev is None or ev['last'] is None:
-                st.info('Waiting for the first closed candle after the start time (cloud needs 78+ bars of history).' if ev else 'Exited - monitoring stopped.')
+            if ev is None:
+                st.info('Exited - monitoring stopped.')
+            elif ev['last'] is None:
+                dg = ev['diag']
+                nxt = next_candle_close(s, now)
+                st.info(f"Waiting for the first candle that CLOSES after the start time ({s['start']}). "
+                        f"Next candle closes at {nxt:%H:%M}{'' if nxt is not None and nxt.date() == now.date() else ('' if nxt is None else nxt.strftime(' %d %b'))}. "
+                        'If that candle closes ABOVE the cloud, lot 1 is bought.')
+                if dg['cloud'] is None:
+                    st.warning(f"Cloud not ready: {dg['bars']} closed bars loaded, need 78+ (Angel returned too little history).")
+                else:
+                    cl_ = dg['cloud']
+                    st.dataframe(pd.DataFrame([{'symbol': s['symbol'], 'latest_closed_bar': str(dg['last_bar'])[:16], 'close': round(cl_['close'], 2),
+                                                'cloud_top': round(cl_['top'], 2), 'cloud_bottom': round(cl_['bottom'], 2),
+                                                'price_vs_cloud': cl_['pos'], 'bars_loaded': dg['bars']}]), width='stretch', hide_index=True)
+                    st.caption('Latest closed bar is before the start time, so it is only shown here - it does not trade.')
             else:
                 last = ev['last']
                 prev = ev['tr']['Close'].iloc[-2] if len(ev['tr']) > 1 else None
