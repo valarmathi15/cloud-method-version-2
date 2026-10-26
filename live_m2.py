@@ -9,7 +9,8 @@ MY STRATEGIES : open a folder -> summary table of all its files, all running liv
 
 How "live paper" works: Method 2 is fully determined by the candles from the strategy START time,
 so every time you open / refresh, the state is rebuilt from Angel One candles (closed candles only).
-No background process is needed for the numbers. (ntfy push alerts need the app to be open.)
+No background process is needed for the numbers. LIVE PRICE (LTP) comes from the Angel One WebSocket feed and
+updates every ~1.5 s on the strategy page; BUY / EXIT decisions still use CLOSED candles only.
 
 Run : python -m streamlit run live_m2.py
 Login details (API key, Client ID, MPIN, TOTP secret) are typed on the first screen.
@@ -220,6 +221,7 @@ def angel_login(client_id, api_key, mpin, totp_secret):
     res = smart.generateSession(client_id, mpin, pyotp.TOTP(totp_secret.replace(' ', '')).now())
     if not res or not res.get('status'):
         raise ValueError((res or {}).get('message', 'login failed'))
+    smart._login_data = res.get('data') or {}
     return smart
 
 
@@ -228,7 +230,24 @@ def _scrip_master():
     return requests.get(SCRIP_URL, timeout=120).json()
 
 
+@st.cache_resource(ttl=86400, show_spinner=False)
+def _token_index():
+    idx = {}
+    for r in _scrip_master():
+        idx.setdefault((r['exch_seg'], r['symbol'].upper()), r['token'])
+    return idx
+
+
 def _instrument_token(exchange, symbol):
+    sym = symbol.strip().upper()
+    idx = _token_index()
+    for key in (sym, sym + '-EQ'):                                # exact match first
+        if (exchange, key) in idx:
+            return idx[(exchange, key)]
+    raise ValueError(f'{symbol} not found on {exchange}  (equity: SBIN-EQ / index: Nifty 50 / MCX: GOLDM05DEC25FUT)')
+
+
+def _instrument_token_old(exchange, symbol):
     sym = symbol.strip().upper()
     hits = [r for r in _scrip_master() if r['exch_seg'] == exchange
             and r['symbol'].upper() in (sym, sym + '-EQ')]
@@ -236,6 +255,119 @@ def _instrument_token(exchange, symbol):
         raise ValueError(f'{symbol} not found on {exchange}  (equity: SBIN-EQ / index: Nifty 50 / MCX: GOLDM05DEC25FUT)')
     hits.sort(key=lambda r: r['symbol'].upper() != sym)          # exact match first
     return hits[0]['token']
+
+
+# =============================================================== LIVE PRICE (Angel One WebSocket)
+EXCH_TYPE = {'NSE': 1, 'NFO': 2, 'BSE': 3, 'BFO': 4, 'MCX': 5}
+
+
+class TickFeed:
+    """One WebSocket connection per login, running in a background thread of the Streamlit server.
+    Keeps the latest quote (ltp / day open-high-low / previous close) and a short tick history per instrument."""
+
+    def __init__(self, creds):
+        self.creds, self.lock = creds, threading.Lock()
+        self.ticks, self.hist, self.wanted = {}, {}, set()
+        self.sws, self.thread, self.connected = None, None, False
+        self.error, self.last_msg = None, 0.0
+
+    # -- public
+    def subscribe(self, exchange, token):
+        key = (EXCH_TYPE.get(exchange, 1), str(token))
+        with self.lock:
+            new = key not in self.wanted
+            self.wanted.add(key)
+        if new and self.connected and self.sws is not None:
+            try:
+                self.sws.subscribe(f'm2_{key[0]}_{key[1]}', 2, [{'exchangeType': key[0], 'tokens': [key[1]]}])
+            except Exception as e:
+                self.error = str(e)
+        if self.thread is None or not self.thread.is_alive():
+            self.thread = threading.Thread(target=self._run, daemon=True)
+            self.thread.start()
+
+    def get(self, exchange, token):
+        return self.ticks.get((EXCH_TYPE.get(exchange, 1), str(token)))
+
+    def history(self, exchange, token):
+        with self.lock:
+            return list(self.hist.get((EXCH_TYPE.get(exchange, 1), str(token)), []))
+
+    # -- internals
+    def _handle(self, msg):
+        if not isinstance(msg, dict) or 'last_traded_price' not in msg:
+            return
+        try:
+            key = (int(msg.get('exchange_type', 1)), str(msg.get('token', '')).strip('"\' \x00'))
+            f = lambda k: float(msg[k]) / 100.0 if msg.get(k) not in (None, '') else None   # prices come in paise
+            now = time.time()
+            old = self.ticks.get(key, {})
+            tk = {'ltp': f('last_traded_price'), 'open': f('open_price_of_the_day') or old.get('open'),
+                  'high': f('high_price_of_the_day') or old.get('high'), 'low': f('low_price_of_the_day') or old.get('low'),
+                  'prev_close': f('closed_price') or old.get('prev_close'), 'ts': now}
+            if not tk['ltp']:
+                return
+            self.ticks[key] = tk
+            with self.lock:
+                self.hist.setdefault(key, __import__('collections').deque(maxlen=20000)).append((now, tk['ltp']))
+            self.last_msg = now
+        except Exception as e:
+            self.error = f'tick parse: {e}'
+
+    def _subscribe_all(self):
+        with self.lock:
+            wanted = list(self.wanted)
+        by_ex = {}
+        for et, tok in wanted:
+            by_ex.setdefault(et, []).append(tok)
+        for et, toks in by_ex.items():
+            self.sws.subscribe(f'm2_{et}', 2, [{'exchangeType': et, 'tokens': toks}])
+
+    def _run(self):
+        from SmartApi.smartWebSocketV2 import SmartWebSocketV2
+        wait = 3
+        while True:
+            try:
+                smart = angel_login(self.creds['client_id'], self.creds['api_key'], self.creds['mpin'], self.creds['totp'])
+                d = smart._login_data
+                sws = SmartWebSocketV2(d['jwtToken'], self.creds['api_key'], self.creds['client_id'],
+                                       d.get('feedToken') or smart.getfeedToken())
+
+                def on_open(wsapp):
+                    self.connected, self.error = True, None
+                    try:
+                        self._subscribe_all()
+                    except Exception as e:
+                        self.error = f'subscribe: {e}'
+
+                def on_data(wsapp, message):
+                    self._handle(message)
+
+                def on_error(wsapp, error):
+                    self.error = f'websocket: {error}'
+
+                def on_close(wsapp, *a):
+                    self.connected = False
+
+                sws.on_open, sws.on_data, sws.on_error, sws.on_close = on_open, on_data, on_error, on_close
+                self.sws = sws
+                wait = 3
+                sws.connect()                                   # blocks until the socket closes
+            except Exception as e:
+                self.error = f'feed: {e}'
+                wait = min(wait * 2, 120)
+            self.connected = False
+            time.sleep(wait)
+
+
+@st.cache_resource(show_spinner=False)
+def _feed_for(client_id, api_key, mpin, totp):
+    return TickFeed({'client_id': client_id, 'api_key': api_key, 'mpin': mpin, 'totp': totp})
+
+
+def get_feed():
+    c = st.session_state['creds']
+    return _feed_for(c['client_id'], c['api_key'], c['mpin'], c['totp'])
 
 
 _RATE_LOCK = threading.Lock()
@@ -289,6 +421,9 @@ def _fetch_range(smart, exchange, token, interval, frm, to):
     if not rows:
         return pd.DataFrame(columns=['Date', 'Open', 'High', 'Low', 'Close'])
     df = pd.DataFrame(rows, columns=['Date', 'Open', 'High', 'Low', 'Close', 'Volume'])
+    for c_ in ('Open', 'High', 'Low', 'Close'):
+        df[c_] = pd.to_numeric(df[c_], errors='coerce')
+    df = df.dropna(subset=['Open', 'High', 'Low', 'Close'])
     df['Date'] = pd.to_datetime(df['Date'])
     if df['Date'].dt.tz is not None:
         df['Date'] = df['Date'].dt.tz_localize(None)
@@ -376,31 +511,10 @@ def compute_m2(df, profit_pct, max_lots, start, qty=1.0, span=None, candle='ever
     buy = tr['Bought'].astype(bool)
     exit_ = tr['Action'] == 'EXIT'
     tr['Signal'] = np.select([buy & exit_, exit_, buy], ['BUY+EXIT', 'EXIT', 'BUY'], 'HOLD')
-    tr['Unrealised %'] = np.where(tr['AvgPrice'].notna(),
-                                  (tr['Close'] - tr['AvgPrice']) / tr['AvgPrice'] * 100, np.nan).round(2)
+    for col in ('AvgPrice', 'Qty'):                          # never bought -> column was all None (object) -> .round() crashed
+        tr[col] = pd.to_numeric(tr[col], errors='coerce')
+    tr['Unrealised %'] = ((tr['Close'] - tr['AvgPrice']) / tr['AvgPrice'] * 100).round(2)
     return tr, trades
-
-
-# =============================================================== ntfy (only on a NEW signal)
-def notify_new_signal(topic, key, last_row):
-    state = {}
-    if os.path.exists(STATE_FILE):
-        with open(STATE_FILE) as f:
-            state = json.load(f)
-    bar = str(last_row['Date'])
-    first_time = key not in state
-    if state.get(key) != bar:
-        state[key] = bar
-        with open(STATE_FILE, 'w') as f:
-            json.dump(state, f)
-        if not first_time and topic and last_row['Signal'] != 'HOLD':     # first run = baseline only
-            msg = (f"{key}: {last_row['Signal']} @ {last_row['Close']:.2f}  |  lots {int(last_row['Lots'])}"
-                   f"  avg {last_row['AvgPrice']}  |  bar {bar}")
-            try:
-                requests.post(f'https://ntfy.sh/{topic}', data=msg.encode('utf-8'),
-                              headers={'Title': 'Method 2 signal'}, timeout=10)
-            except Exception as e:
-                st.warning(f'ntfy failed: {e}')
 
 
 def get_smart():
@@ -803,28 +917,80 @@ def restart_strategy(folder, fname):
     save_strategy(folder, fname, s)
 
 
-def next_candle_close(s, now):
+def session_times(s, base):
+    """(open time, [candle close times]) of one trading day."""
     ch, cm = [int(x) for x in s['close'].split(':')]
     oh, om = (9, 0) if s['exchange'] == 'MCX' else (9, 15)
+    o, c = base + pd.Timedelta(hours=oh, minutes=om), base + pd.Timedelta(hours=ch, minutes=cm)
+    if s['tf'] == '1D':
+        return o, [c]
+    if s['tf'] == '4H':
+        return o, [o + pd.Timedelta(hours=4), c]
+    delta, times, x = TF[s['tf']][1], [], o + TF[s['tf']][1]
+    while x < c:
+        times.append(x)
+        x += delta
+    return o, times + [c]
+
+
+def next_candle_close(s, now):
     for i in range(8):
         base = pd.Timestamp(now).normalize() + pd.Timedelta(days=i)
         if base.weekday() >= 5:
             continue
-        o, c = base + pd.Timedelta(hours=oh, minutes=om), base + pd.Timedelta(hours=ch, minutes=cm)
-        if s['tf'] == '1D':
-            times = [c]
-        elif s['tf'] == '4H':
-            times = [o + pd.Timedelta(hours=4), c]
-        else:
-            delta, times, x = TF[s['tf']][1], [], o + TF[s['tf']][1]
-            while x < c:
-                times.append(x)
-                x += delta
-            times.append(c)
-        for x in times:
+        for x in session_times(s, base)[1]:
             if x > now:
                 return x
     return None
+
+
+def current_bar_start(s, now):
+    """start of the candle that is running right now (None when the market is closed)."""
+    base = pd.Timestamp(now).normalize()
+    if base.weekday() >= 5:
+        return None
+    o, ends = session_times(s, base)
+    if now < o or now >= ends[-1]:
+        return None
+    prev = [x for x in ends if x <= now]
+    return prev[-1] if prev else o
+
+
+def quote_panel(fol, fname):
+    """LIVE price strip - re-runs every ~1.5 s on its own (does not touch the candle maths)."""
+    try:
+        s = load_strategy(fol, fname)
+        feed = get_feed()
+        token = _instrument_token(s['exchange'], s['symbol'])
+        feed.subscribe(s['exchange'], token)
+    except Exception as e:
+        st.caption(f'Live price not available: {e}')
+        return
+    tk = feed.get(s['exchange'], token)
+    if tk is None:
+        st.caption('Live price: ' + (f'error - {feed.error}' if feed.error else
+                   ('connecting ...' if not feed.connected else 'connected, waiting for the first tick (market closed?)')))
+        return
+    now = now_ist()
+    age = time.time() - tk['ts']
+    ltp, prev = tk['ltp'], tk.get('prev_close')
+    chg = (ltp - prev) if prev else None
+    c = st.columns(6)
+    c[0].metric('LTP' + (' 🟢' if age < 10 else ' 🟡'), f'{ltp:,.2f}',
+                None if chg is None else f'{chg:+,.2f} ({chg / prev * 100:+.2f}%)')
+    c[1].metric('Day open', '-' if not tk.get('open') else f"{tk['open']:,.2f}")
+    c[2].metric('Day high', '-' if not tk.get('high') else f"{tk['high']:,.2f}")
+    c[3].metric('Day low', '-' if not tk.get('low') else f"{tk['low']:,.2f}")
+    start = current_bar_start(s, now)
+    if start is not None:
+        pts = [p for ts_, p in feed.history(s['exchange'], token) if ts_ist(ts_) >= start]
+        if pts:
+            c[4].metric(f"Running {s['tf']} candle", f'{pts[-1]:,.2f}', f'O {pts[0]:,.2f} | H {max(pts):,.2f} | L {min(pts):,.2f}', delta_color='off')
+    pos = st.session_state.get(f'pos_{fol}_{fname}')
+    if pos and pos.get('lots', 0) > 0 and pos.get('avg'):
+        pnl = (ltp - pos['avg']) * pos['units']
+        c[5].metric('Open P&L @ LTP', f'{pnl:,.2f}', f"{(ltp / pos['avg'] - 1) * 100:+.2f}%")
+    st.caption(f"tick {ts_ist(tk['ts']):%H:%M:%S}  |  entries / exits use CLOSED candles only; this strip is just the live price")
 
 
 def csv_button(label, df, key):
@@ -843,6 +1009,8 @@ def page_file(topic, refresh, fol, fname):
         st.rerun()
         return
     st.markdown(f"# {fol} / {s0['name']}")
+    if not s0.get('stopped'):
+        st.fragment(run_every=1.5)(quote_panel)(fol, fname)
 
     def body():
         s = load_strategy(fol, fname)
@@ -916,7 +1084,6 @@ def page_file(topic, refresh, fol, fname):
             except Exception as e:
                 st.error(f'Could not load data: {e}')
                 return
-            notify_new_signal(topic, f"{st.session_state['creds']['client_id']}/{fol}/{fname}", ev['last']) if ev['last'] is not None else None
             open_txt = '09:00' if s['exchange'] == 'MCX' else '09:15'
             is_open = now.weekday() < 5 and open_txt <= now.strftime('%H:%M') <= s.get('close', '15:30')
             st.markdown(f"**{state}** | {s['exchange']} market **{'OPEN' if is_open else 'CLOSED'}** | now {now:%H:%M:%S} IST | "
@@ -929,6 +1096,9 @@ def page_file(topic, refresh, fol, fname):
             else:
                 st.caption(f"Engine: Waiting for the next candle ({nxt:%H:%M}{'' if nxt.date() == now.date() else nxt.strftime(' %d %b')})" if nxt is not None else 'Engine: -')
             last, tr, trades = ev['last'], ev['tr'], ev['trades']
+            holding_ = last is not None and not ev['flat']
+            st.session_state[f'pos_{fol}_{fname}'] = ({'lots': int(last['Lots']), 'avg': float(last['AvgPrice']), 'units': float(last['Qty'])}
+                                                       if holding_ else {'lots': 0})
             closed = trades[~trades['Exit Reason'].str.startswith('Open at end')] if not trades.empty else trades
             win = f"{(closed['PnL (pts x qty)'] > 0).mean() * 100:.0f}%" if len(closed) else '-'
             m = st.columns(5)
@@ -1072,10 +1242,6 @@ def page_view(topic, refresh):
                     evs[(fol, f)] = evaluate(s)
                 except Exception as e:
                     errs[(fol, f)] = str(e)
-        for (fol, f), ev in evs.items():                           # push alert on a NEW closed-candle signal
-            if ev['last'] is not None:
-                notify_new_signal(topic, f"{st.session_state['creds']['client_id']}/{fol}/{f}", ev['last'])
-
         # ---- one-line live status
         now = now_ist().to_pydatetime()
         any_s = next((s for fol in shown for _, s in data[fol] if not s.get('stopped')), None)
@@ -1155,6 +1321,14 @@ def page_view(topic, refresh):
                     size = f"amount/lot {s['amount']:,.0f}" if s.get('amount') else f"qty/lot {s['qty']:g}"
                     r[0].caption(f"{s['exchange']} · {s['tf']} · {s['lots']} lots · exit {exit_text(s)} · {candle_text(s).lower()} · {size} · capital {s['capital']:g} · started {s['start']}")
                     r[1].write(s['symbol'])
+                    if not s.get('stopped'):
+                        try:
+                            tok_ = _instrument_token(s['exchange'], s['symbol'])
+                            get_feed().subscribe(s['exchange'], tok_)
+                            tk_ = get_feed().get(s['exchange'], tok_)
+                            r[1].caption('LTP ' + (f"{tk_['ltp']:,.2f}" if tk_ else '...'))
+                        except Exception:
+                            pass
                     dot = {'Running': '🟢', 'Paused': '🟡', 'Stopped': '⚫', 'Error': '🔴'}[x['state']]
                     r[2].write(f"{dot} {x['state']}")
                     r[2].caption(x['sub'])
@@ -1227,12 +1401,17 @@ def main():
     if page == 'builder':
         page_builder()
     else:
-        page_view(st.session_state.get('ntfy_topic', ''), st.session_state.get('refresh_secs', 60))
+        page_view('', st.session_state.get('refresh_secs', 60))
 
     st.write('')
     with st.expander('⚙️ Account'):
         st.write(f"Client ID: {st.session_state['creds']['client_id']}")
-        st.text_input('ntfy topic (optional)', key='ntfy_topic')
+        try:
+            fd = get_feed()
+            st.caption('Live price feed: ' + ('connected' if fd.connected else 'not connected') +
+                       (f' | {fd.error}' if fd.error else '') + f' | {len(fd.wanted)} instrument(s) subscribed')
+        except Exception:
+            pass
         st.number_input('Refresh every (seconds)', 15, 3600, 60, 15, key='refresh_secs')
         if st.button('Logout / change details'):
             for k_ in ('creds', 'smart'):
