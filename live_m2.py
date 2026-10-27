@@ -61,10 +61,10 @@ INTERVAL_MAX_DAYS = {'ONE_DAY': 1900, 'ONE_HOUR': 380, 'THIRTY_MINUTE': 190, 'FI
 LOTS_OPTIONS = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
 TARGET_OPTIONS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
 SPAN_ONLY = {'SPAN A': 'A', 'SPAN B': 'B', 'SPAN A & B': 'A&B', 'SPAN A OR B': 'AorB'}
-CLOUD_EXIT = {'Above cloud': 'CloudAbove', 'Below cloud': 'CloudBelow'}
+CLOUD_EXIT = {'Above cloud': 'CloudAbove', 'Inside cloud': 'CloudInside', 'Below cloud': 'CloudBelow'}
 SPAN_OPTIONS = {**SPAN_ONLY, **CLOUD_EXIT}                      # every non-% exit (stored in the file as `span`)
 EXIT_OPTIONS = TARGET_OPTIONS + list(SPAN_OPTIONS)               # profit target % + span exits + cloud exits
-ENTRY_OPTIONS = {'Above cloud': 'above', 'Below cloud': 'below'}
+ENTRY_OPTIONS = {'Above cloud': 'above', 'Inside cloud': 'inside', 'Below cloud': 'below'}
 AMOUNT_OPTIONS = [1000, 5000, 10000, 25000, 50000, 100000, 200000, 500000]
 QTY_OPTIONS = [1, 2, 5, 10, 25, 50, 75, 100, 150, 200, 500, 1000]
 CANDLE_OPTIONS = {'Every candle': 'every', 'Daily': 'daily', 'Weekly': 'weekly'}
@@ -81,7 +81,7 @@ def size_text(s):
 
 
 def entry_text(s):
-    return 'below cloud' if s.get('entry') == 'below' else 'above cloud'
+    return {'below': 'below cloud', 'inside': 'inside cloud'}.get(s.get('entry'), 'above cloud')
 
 
 def exit_text(s):
@@ -116,9 +116,10 @@ SPAN_RULES = {                       # exit rule for the "Span" options (price =
     'AorB': lambda p, a, b: p < a or p < b,       # below EITHER span (= below the cloud top)
     'CloudAbove': lambda p, a, b: p > max(a, b),  # closed ABOVE the cloud top
     'CloudBelow': lambda p, a, b: p < min(a, b),  # closed BELOW the cloud bottom
+    'CloudInside': lambda p, a, b: min(a, b) <= p <= max(a, b),   # closed INSIDE the cloud
 }
 SPAN_TEXT = {'A': 'Span A', 'B': 'Span B', 'A&B': 'Span A & B', 'AorB': 'Span A or B',
-             'CloudAbove': 'the cloud top', 'CloudBelow': 'the cloud bottom'}
+             'CloudAbove': 'the cloud top', 'CloudBelow': 'the cloud bottom', 'CloudInside': 'the cloud'}
 
 
 def run_m2(df, profit_target_pct, max_lots, start_date=None, lot_qty=1.0, trace=None, span=None, candle='every', lot_amount=None, skip=None, entry='above'):
@@ -126,7 +127,7 @@ def run_m2(df, profit_target_pct, max_lots, start_date=None, lot_qty=1.0, trace=
     span   : None = exit on Profit target %;  'A' / 'B' / 'A&B' / 'AorB' = exit when Close falls below that span
              (whole position closed; span exits go flat, no repeat exits).
     lot_amount : None = every lot buys `lot_qty` units;  number = every lot invests this AMOUNT (units = amount / lot price).
-    entry  : 'above' = buy while Close is ABOVE the cloud top;  'below' = buy while Close is BELOW the cloud bottom.
+    entry  : 'above' = buy while Close is ABOVE the cloud top;  'below' = BELOW the cloud bottom;  'inside' = INSIDE the cloud.
     skip   : list of (from, to) timestamps - bars inside are ignored (strategy was paused; no buy / exit then).
     candle : 'every' = buy 1 lot on every candle above the cloud;  'daily' = at most 1 lot per day;
              'weekly' = at most 1 lot per week (first candle of the period that closes above the cloud).
@@ -145,7 +146,7 @@ def run_m2(df, profit_target_pct, max_lots, start_date=None, lot_qty=1.0, trace=
             return (y, w)
         return None
 
-    exit_reason = (('Closed above the cloud (Method 2)' if span == 'CloudAbove' else f'Closed below {SPAN_TEXT[span]} (Method 2)') if span_hit
+    exit_reason = (({'CloudAbove': 'Closed above the cloud (Method 2)', 'CloudInside': 'Closed inside the cloud (Method 2)'}.get(span) or f'Closed below {SPAN_TEXT[span]} (Method 2)') if span_hit
                    else f'Profit target {profit_target_pct}% hit (Method 2 - sheet logic)')
     trades = []
     trade_id = 0
@@ -159,7 +160,12 @@ def run_m2(df, profit_target_pct, max_lots, start_date=None, lot_qty=1.0, trace=
         price, date = row['Close'], row['Date']
         if skip and any(a < date < b for a, b in skip):
             continue
-        above = bool(row['AboveCloud']) if entry == 'above' else bool(price < row['CloudBottom'])   # entry condition met?
+        if entry == 'above':                                                                       # entry condition met?
+            above = bool(row['AboveCloud'])
+        elif entry == 'below':
+            above = bool(price < row['CloudBottom'])
+        else:                                                                                      # inside the cloud
+            above = bool(row['CloudBottom'] <= price <= row['CloudTop'])
         bought, prev_lots = False, 0
         if m2_first:
             m2_first = False
@@ -598,7 +604,7 @@ def create_strategies(folder, prefix, exchange, symbols, tfs, capital, sizes, cl
                     name = (f"{prefix + ' ' if prefix else ''}{sym} {tf} {lots}lots {exit_label(ex)}"
                             + ('' if cdc == 'every' else f' {cdc}')
                             + (f' amt{val:g}' if kind == 'amt' else (' eq' if kind == 'eq' else (f' q{val:g}' if len(sizes) > 1 else '')))
-                            + (' belowcloud' if ent == 'below' else ''))
+                            + {'below': ' belowcloud', 'inside': ' insidecloud'}.get(ent, ''))
                     path = os.path.join(d, safe(name) + '.json')
                     if os.path.exists(path):
                         skipped.append(name)
@@ -1091,7 +1097,7 @@ def page_file(topic, refresh, fol, fname):
             val = e2.number_input('Quantity per lot' if by == 'Quantity' else 'Amount per lot', min_value=0.0,
                                   value=float(s['amount'] if s.get('amount') else s['qty']), key=f'ed_val_{fname}_{by}')
             new_cap = e3.number_input('Capital', min_value=0.0, value=float(s['capital']), step=10000.0, key=f'ed_cap_{fname}')
-            new_entry = st.selectbox('Entry', list(ENTRY_OPTIONS), index=1 if s.get('entry') == 'below' else 0, key=f'ed_ent_{fname}')
+            new_entry = st.selectbox('Entry', list(ENTRY_OPTIONS), index=list(ENTRY_OPTIONS.values()).index(s.get('entry', 'above')), key=f'ed_ent_{fname}')
             st.caption('Numbers are re-calculated from the start time with the new settings.')
             if st.button('Save settings', key=f'ed_save_{fname}'):
                 s['lots'], s['capital'], s['candle'] = int(new_lots), new_cap, CANDLE_OPTIONS[new_cd]
